@@ -7,7 +7,7 @@ const AWS_REGION = process.env.S3_REGION || 'us-east-1'
 const AWS_ACCESS_KEY_ID = process.env.S3_ACCESS_KEY_ID || ''
 const AWS_SECRET_ACCESS_KEY = process.env.S3_SECRET_ACCESS_KEY || ''
 const S3_BUCKET_NAME = process.env.S3_BUCKET_NAME || ''
-const S3_PREFIX = process.env.S3_PREFIX || 'photos/'
+const S3_PREFIX = process.env.S3_PREFIX || ''
 const S3_ENDPOINT = process.env.S3_ENDPOINT || ''
 
 if (!AWS_ACCESS_KEY_ID || !AWS_SECRET_ACCESS_KEY || !S3_BUCKET_NAME) {
