@@ -25,6 +25,15 @@ export async function detectHeicFormat(file: File | Blob): Promise<boolean> {
   }
 }
 
+export const isBrowserSupportHeic = () => {
+  const isSafari = /^(?:(?!chrome|android).)*safari/i.test(navigator.userAgent)
+  const safariVersionMatch = navigator.userAgent.match(/version\/(\d+)/i)
+  const versionString = safariVersionMatch?.[1]
+  const version = versionString ? Number.parseInt(versionString, 10) : 0
+
+  return isSafari && version >= 17
+}
+
 /**
  * 将 HEIC/HEIF 图片转换为 JPEG 或 PNG
  */
@@ -32,7 +41,7 @@ export async function convertHeicImage(
   file: File | Blob,
   options: HeicConversionOptions = {},
 ): Promise<ConversionResult> {
-  const { quality = 1, format = 'image/png' } = options
+  const { quality = 1, format = 'image/jpeg' } = options
 
   try {
     // 检查是否为 HEIC 格式

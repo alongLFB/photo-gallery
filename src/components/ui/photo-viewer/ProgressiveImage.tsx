@@ -5,6 +5,7 @@ import { clsxm } from '~/lib/cn'
 import {
   convertHeicImage,
   detectHeicFormat,
+  isBrowserSupportHeic,
   revokeConvertedUrl,
 } from '~/lib/heic-converter'
 import { Spring } from '~/lib/spring'
@@ -101,10 +102,12 @@ export const ProgressiveImage = ({
 
           try {
             // 检测是否为 HEIC 格式
-            const isHeic = await detectHeicFormat(blob)
-            setIsHeicFormat(isHeic)
+            const shouldHeicTransformed =
+              !isBrowserSupportHeic() && (await detectHeicFormat(blob))
 
-            if (isHeic) {
+            setIsHeicFormat(shouldHeicTransformed)
+
+            if (shouldHeicTransformed) {
               // 如果是 HEIC 格式，进行转换
               setIsConverting(true)
               try {
@@ -253,9 +256,6 @@ export const ProgressiveImage = ({
               {isConverting ? (
                 <>
                   <p className="text-sm">正在转换 HEIC 图片...</p>
-                  <p className="text-xs text-white/70 mt-1">
-                    使用高性能 WASM 引擎
-                  </p>
                 </>
               ) : isHeicFormat ? (
                 <>

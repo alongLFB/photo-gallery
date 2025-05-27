@@ -115,13 +115,22 @@ class WebGLImageViewerEngine {
   private lastRenderTime = 0
   private renderThrottleDelay = 16 // ~60fps
 
-  // Texture optimization state
+  // LOD (Level of Detail) texture management
   private originalImage: HTMLImageElement | null = null
-  private textureDebounceId: ReturnType<typeof setTimeout> | null = null
-  private textureDebounceDelay = 300 // ms
-  private currentTextureScale = 1
-  private lastOptimalTextureSize = { width: 0, height: 0 }
+  private lodTextures = new Map<number, WebGLTexture>() // LOD level -> texture
+  private currentLOD = 0
+  private lodUpdateDebounceId: ReturnType<typeof setTimeout> | null = null
+  private lodUpdateDelay = 200 // ms
   private maxTextureSize = 0 // WebGL maximum texture size
+
+  // LOD levels configuration
+  private readonly LOD_LEVELS = [
+    { scale: 0.25, maxViewportScale: 0.5 }, // LOD 0: 1/4 resolution for very zoomed out
+    { scale: 0.5, maxViewportScale: 1 }, // LOD 1: 1/2 resolution for zoomed out
+    { scale: 1, maxViewportScale: 2 }, // LOD 2: full resolution for normal view
+    { scale: 2, maxViewportScale: 4 }, // LOD 3: 2x resolution for zoomed in
+    { scale: 4, maxViewportScale: Infinity }, // LOD 4: 4x resolution for very zoomed in
+  ]
 
   // Configuration
   private config: Required<WebGLImageViewerProps>
@@ -254,8 +263,8 @@ class WebGLImageViewerEngine {
       // 窗口大小改变时，需要重新约束缩放倍数和位置
       this.constrainScaleAndPosition()
       this.render()
-      // canvas尺寸变化时也需要检查纹理更新
-      this.debouncedTextureUpdate()
+      // canvas尺寸变化时也需要检查LOD更新
+      this.debouncedLODUpdate()
       // 通知缩放变化
       this.notifyZoomChange()
     }
@@ -366,145 +375,113 @@ class WebGLImageViewerEngine {
 
   private createTexture(image: HTMLImageElement) {
     this.originalImage = image
-    this.createOptimizedTexture()
+    this.initializeLODTextures()
   }
 
-  private createOptimizedTexture() {
+  private initializeLODTextures() {
     if (!this.originalImage) return
 
-    const { gl } = this
+    // 清理现有的 LOD 纹理
+    this.cleanupLODTextures()
 
-    // 计算当前最优纹理尺寸
-    const optimalSize = this.calculateOptimalTextureSize()
-    this.lastOptimalTextureSize = optimalSize
+    // 创建基础 LOD 纹理（LOD 2: 原始分辨率）
+    this.createLODTexture(2)
+    this.currentLOD = 2
+    this.texture = this.lodTextures.get(2) || null
+  }
+
+  private createLODTexture(lodLevel: number): WebGLTexture | null {
+    if (
+      !this.originalImage ||
+      lodLevel < 0 ||
+      lodLevel >= this.LOD_LEVELS.length
+    ) {
+      return null
+    }
+
+    const { gl } = this
+    const lodConfig = this.LOD_LEVELS[lodLevel]
 
     try {
-      // 创建离屏canvas来调整图片尺寸
+      // 计算 LOD 纹理尺寸
+      const lodWidth = Math.max(
+        1,
+        Math.round(this.originalImage.width * lodConfig.scale),
+      )
+      const lodHeight = Math.max(
+        1,
+        Math.round(this.originalImage.height * lodConfig.scale),
+      )
+
+      // 确保不超过 WebGL 最大纹理尺寸
+      const maxSize = Math.min(this.maxTextureSize, 4096) // 设置合理的上限
+      const finalWidth = Math.min(lodWidth, maxSize)
+      const finalHeight = Math.min(lodHeight, maxSize)
+
+      // 创建离屏 canvas
       const offscreenCanvas = document.createElement('canvas')
       const offscreenCtx = offscreenCanvas.getContext('2d')!
 
-      offscreenCanvas.width = optimalSize.width
-      offscreenCanvas.height = optimalSize.height
+      offscreenCanvas.width = finalWidth
+      offscreenCanvas.height = finalHeight
 
-      // 设置高质量的图像渲染
-      offscreenCtx.imageSmoothingEnabled = true
-      offscreenCtx.imageSmoothingQuality = 'high'
-
-      // 对于小图片或放大的情况，使用更精细的渲染策略
-      const isSmallImage =
-        this.originalImage.width < 512 || this.originalImage.height < 512
-      const isUpscaling =
-        optimalSize.width > this.originalImage.width ||
-        optimalSize.height > this.originalImage.height
-
-      if (isSmallImage || isUpscaling) {
-        // 对于小图片或需要放大的情况，使用最高质量的渲染
-        offscreenCtx.imageSmoothingEnabled = false // 禁用平滑以保持锐利
-
-        // 如果是放大，先绘制到中间尺寸，再放大到目标尺寸（阶梯式放大）
-        if (
-          isUpscaling &&
-          (optimalSize.width > this.originalImage.width * 2 ||
-            optimalSize.height > this.originalImage.height * 2)
-        ) {
-          const intermediateCanvas = document.createElement('canvas')
-          const intermediateCtx = intermediateCanvas.getContext('2d')!
-
-          // 计算中间尺寸（2倍原图大小）
-          const intermediateWidth = this.originalImage.width * 2
-          const intermediateHeight = this.originalImage.height * 2
-
-          intermediateCanvas.width = intermediateWidth
-          intermediateCanvas.height = intermediateHeight
-
-          intermediateCtx.imageSmoothingEnabled = false
-          intermediateCtx.drawImage(
-            this.originalImage,
-            0,
-            0,
-            this.originalImage.width,
-            this.originalImage.height,
-            0,
-            0,
-            intermediateWidth,
-            intermediateHeight,
-          )
-
-          // 然后从中间尺寸绘制到最终尺寸
-          offscreenCtx.imageSmoothingEnabled = true
-          offscreenCtx.imageSmoothingQuality = 'high'
-          offscreenCtx.drawImage(
-            intermediateCanvas,
-            0,
-            0,
-            intermediateWidth,
-            intermediateHeight,
-            0,
-            0,
-            optimalSize.width,
-            optimalSize.height,
-          )
-        } else {
-          // 直接绘制，保持像素完美
-          offscreenCtx.drawImage(
-            this.originalImage,
-            0,
-            0,
-            this.originalImage.width,
-            this.originalImage.height,
-            0,
-            0,
-            optimalSize.width,
-            optimalSize.height,
-          )
-        }
+      // 根据 LOD 级别选择渲染质量
+      if (lodConfig.scale >= 1) {
+        // 高分辨率 LOD，使用高质量渲染
+        offscreenCtx.imageSmoothingEnabled = true
+        offscreenCtx.imageSmoothingQuality = 'high'
       } else {
-        // 对于大图片的缩小，使用标准的高质量平滑
-        offscreenCtx.drawImage(
-          this.originalImage,
-          0,
-          0,
-          this.originalImage.width,
-          this.originalImage.height,
-          0,
-          0,
-          optimalSize.width,
-          optimalSize.height,
-        )
+        // 低分辨率 LOD，使用快速渲染
+        offscreenCtx.imageSmoothingEnabled = true
+        offscreenCtx.imageSmoothingQuality = 'medium'
       }
 
-      // 删除旧纹理
-      if (this.texture) {
-        gl.deleteTexture(this.texture)
-        this.texture = null
+      // 绘制图像到目标尺寸
+      offscreenCtx.drawImage(
+        this.originalImage,
+        0,
+        0,
+        this.originalImage.width,
+        this.originalImage.height,
+        0,
+        0,
+        finalWidth,
+        finalHeight,
+      )
+
+      // 创建 WebGL 纹理
+      const texture = gl.createTexture()
+      if (!texture) {
+        console.error(`Failed to create LOD ${lodLevel} texture`)
+        return null
       }
 
-      // 创建新纹理
-      this.texture = gl.createTexture()
-      if (!this.texture) {
-        console.error('Failed to create WebGL texture')
-        return
-      }
+      gl.bindTexture(gl.TEXTURE_2D, texture)
 
-      gl.bindTexture(gl.TEXTURE_2D, this.texture)
-
-      // 设置纹理参数，防止边框效果
+      // 设置纹理参数
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
 
-      // 根据图片类型和缩放情况选择最佳的过滤方式
-      const isSmallImageForFilter =
-        this.originalImage.width < 512 || this.originalImage.height < 512
-      const currentRelativeScale = this.scale / this.getFitToScreenScale()
-
-      if (isSmallImageForFilter && currentRelativeScale > 1) {
-        // 对于放大的小图片，使用最近邻插值保持锐利
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
-      } else {
-        // 其他情况使用线性插值获得平滑效果
+      // 根据 LOD 级别选择过滤方式
+      if (lodConfig.scale >= 2) {
+        // 高分辨率纹理，使用线性过滤获得平滑效果
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+      } else if (lodConfig.scale < 1) {
+        // 低分辨率纹理，使用线性过滤避免锯齿
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+      } else {
+        // 原始分辨率，根据图像类型选择
+        const isPixelArt =
+          this.originalImage.width < 512 || this.originalImage.height < 512
+        if (isPixelArt) {
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+        } else {
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+        }
       }
 
       // 上传纹理数据
@@ -520,331 +497,93 @@ class WebGLImageViewerEngine {
       // 检查 WebGL 错误
       const error = gl.getError()
       if (error !== gl.NO_ERROR) {
-        console.error('WebGL texture creation error:', error)
-        // 如果纹理创建失败，尝试使用更小的尺寸
-        if (optimalSize.width > 1024 || optimalSize.height > 1024) {
-          this.createFallbackTexture()
-          return
-        }
+        console.error(`WebGL error creating LOD ${lodLevel} texture:`, error)
+        gl.deleteTexture(texture)
+        return null
       }
 
-      this.currentTextureScale = this.scale
+      // 存储纹理
+      this.lodTextures.set(lodLevel, texture)
+
+      console.info(
+        `Created LOD ${lodLevel} texture: ${finalWidth}×${finalHeight} (scale: ${lodConfig.scale})`,
+      )
+      return texture
     } catch (error) {
-      console.error('Error creating optimized texture:', error)
-      this.createFallbackTexture()
+      console.error(`Error creating LOD ${lodLevel} texture:`, error)
+      return null
     }
   }
 
-  private createFallbackTexture() {
-    if (!this.originalImage) return
-
+  private cleanupLODTextures() {
     const { gl } = this
 
-    try {
-      // 使用更保守的纹理尺寸作为后备方案
-      const fallbackSize = this.calculateFallbackTextureSize()
-      this.lastOptimalTextureSize = fallbackSize
-
-      const offscreenCanvas = document.createElement('canvas')
-      const offscreenCtx = offscreenCanvas.getContext('2d')!
-
-      offscreenCanvas.width = fallbackSize.width
-      offscreenCanvas.height = fallbackSize.height
-
-      // 对于fallback纹理也应用相同的高质量渲染策略
-      const isSmallImageFallback =
-        this.originalImage.width < 512 || this.originalImage.height < 512
-      const isUpscalingFallback =
-        fallbackSize.width > this.originalImage.width ||
-        fallbackSize.height > this.originalImage.height
-
-      if (isSmallImageFallback || isUpscalingFallback) {
-        offscreenCtx.imageSmoothingEnabled = false
-      } else {
-        offscreenCtx.imageSmoothingEnabled = true
-        offscreenCtx.imageSmoothingQuality = 'high'
-      }
-
-      offscreenCtx.drawImage(
-        this.originalImage,
-        0,
-        0,
-        this.originalImage.width,
-        this.originalImage.height,
-        0,
-        0,
-        fallbackSize.width,
-        fallbackSize.height,
-      )
-
-      if (this.texture) {
-        gl.deleteTexture(this.texture)
-        this.texture = null
-      }
-
-      this.texture = gl.createTexture()
-      if (!this.texture) {
-        console.error('Failed to create fallback WebGL texture')
-        return
-      }
-
-      gl.bindTexture(gl.TEXTURE_2D, this.texture)
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
-
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.RGBA,
-        gl.RGBA,
-        gl.UNSIGNED_BYTE,
-        offscreenCanvas,
-      )
-
-      this.currentTextureScale = this.scale
-    } catch (error) {
-      console.error('Error creating fallback texture:', error)
+    // 删除所有现有的 LOD 纹理
+    for (const [_level, texture] of this.lodTextures) {
+      gl.deleteTexture(texture)
     }
+    this.lodTextures.clear()
+
+    // 清理主纹理引用
+    this.texture = null
   }
 
-  private calculateFallbackTextureSize(): { width: number; height: number } {
-    if (!this.originalImage) return { width: 0, height: 0 }
+  private selectOptimalLOD(): number {
+    if (!this.originalImage) return 2 // 默认使用原始分辨率
 
-    const aspectRatio = this.originalImage.width / this.originalImage.height
-    const devicePixelRatio = window.devicePixelRatio || 1
-
-    // 使用相对保守但仍能保证质量的尺寸
-    // 在高DPI设备上允许稍大的后备纹理
-    const maxSize = devicePixelRatio >= 2 ? 1536 : 1024
-
-    let width, height
-    if (aspectRatio >= 1) {
-      width = Math.min(maxSize, this.originalImage.width)
-      height = Math.min(width / aspectRatio, this.originalImage.height)
-    } else {
-      height = Math.min(maxSize, this.originalImage.height)
-      width = Math.min(height * aspectRatio, this.originalImage.width)
-    }
-
-    return { width: Math.round(width), height: Math.round(height) }
-  }
-
-  private calculateOptimalTextureSize(): { width: number; height: number } {
-    if (!this.originalImage) return { width: 0, height: 0 }
-
-    // 计算原图的宽高比
-    const aspectRatio = this.originalImage.width / this.originalImage.height
-
-    // 计算当前显示在屏幕上的图片尺寸
-    const displayWidth = this.imageWidth * this.scale
-    const displayHeight = this.imageHeight * this.scale
-
-    // 计算设备像素比，确保在高DPI屏幕上也有足够的清晰度
-    const devicePixelRatio = window.devicePixelRatio || 1
-
-    // 检测移动设备
-    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
-
-    // 基于显示尺寸和设备像素比计算目标纹理尺寸
-    let targetWidth = displayWidth * devicePixelRatio
-    let targetHeight = displayHeight * devicePixelRatio
-
-    // 应用超采样来提高质量，减少锯齿
-    // 在高DPI屏幕上或放大时使用更高的超采样倍率
     const fitToScreenScale = this.getFitToScreenScale()
     const relativeScale = this.scale / fitToScreenScale
 
-    let supersamplingFactor = 1
-    if (relativeScale >= 1) {
-      // 正常大小或放大时，使用较高的超采样
-      // 在高DPI移动设备上使用更积极的超采样
-      const maxSupersampling = devicePixelRatio >= 2 && isMobile ? 2.5 : 2
-      supersamplingFactor = Math.min(maxSupersampling, 1 + relativeScale * 0.6)
-    } else {
-      // 缩小时，仍然保持一定的超采样以减少锯齿
-      // 在高DPI设备上保持更高的基础质量
-      const baseSupersampling = devicePixelRatio >= 2 ? 1.5 : 1.2
-      supersamplingFactor = Math.max(
-        baseSupersampling,
-        Math.min(2, 2 - relativeScale),
-      )
-    }
-
-    targetWidth *= supersamplingFactor
-    targetHeight *= supersamplingFactor
-
-    // 应用智能的纹理大小限制
-    const isSafari =
-      /Safari/i.test(navigator.userAgent) &&
-      !/Chrome/i.test(navigator.userAgent)
-
-    // 为移动设备设置智能的最大纹理尺寸
-    let effectiveMaxTextureSize = this.maxTextureSize
-    if (isMobile) {
-      if (isSafari) {
-        // iPhone/iPad Safari: 使用更智能的策略
-        // 对于高分辨率设备，允许更大的纹理
-        const isHighDPI = devicePixelRatio >= 2
-        const screenSize = Math.max(window.screen.width, window.screen.height)
-
-        if (isHighDPI && screenSize >= 1024) {
-          // iPhone Pro/iPad Pro 等高端设备，允许更大纹理
-          effectiveMaxTextureSize = Math.min(4096, this.maxTextureSize)
-        } else if (screenSize >= 768) {
-          // 标准 iPhone/iPad，使用中等纹理尺寸
-          effectiveMaxTextureSize = Math.min(3072, this.maxTextureSize)
-        } else {
-          // 较小屏幕设备，使用保守尺寸
-          effectiveMaxTextureSize = Math.min(2048, this.maxTextureSize)
-        }
-      } else {
-        // Android 设备通常有更好的 WebGL 支持
-        effectiveMaxTextureSize = Math.min(4096, this.maxTextureSize)
+    // 根据当前的视口缩放选择最佳的 LOD 级别
+    for (let i = 0; i < this.LOD_LEVELS.length; i++) {
+      if (relativeScale <= this.LOD_LEVELS[i].maxViewportScale) {
+        return i
       }
     }
 
-    // 确保纹理尺寸不会过小，但也要考虑性能
-    // 对于小图片，使用更智能的最小尺寸策略
-    const isSmallOriginalImage =
-      this.originalImage.width < 512 || this.originalImage.height < 512
-
-    let baseMinDimension
-    if (isSmallOriginalImage) {
-      // 对于小图片，允许更大的纹理尺寸以保持清晰度
-      baseMinDimension = devicePixelRatio >= 2 ? 2048 : 1536
-    } else {
-      // 对于大图片，使用标准的最小尺寸
-      baseMinDimension = devicePixelRatio >= 2 ? 1024 : 512
-    }
-
-    const minDimension = Math.min(
-      Math.max(baseMinDimension, devicePixelRatio >= 3 ? 1536 : 1024),
-      Math.max(
-        baseMinDimension,
-        // 对于小图片，允许纹理尺寸超过原图尺寸
-        isSmallOriginalImage
-          ? baseMinDimension
-          : Math.min(this.originalImage.width, this.originalImage.height),
-      ),
-    )
-
-    // 根据宽高比确定最小尺寸
-    let minWidth, minHeight
-    if (aspectRatio >= 1) {
-      // 宽图或正方形
-      minWidth = minDimension
-      minHeight = minDimension / aspectRatio
-    } else {
-      // 高图
-      minWidth = minDimension * aspectRatio
-      minHeight = minDimension
-    }
-
-    // 应用最小尺寸约束，但保持宽高比
-    if (targetWidth < minWidth || targetHeight < minHeight) {
-      const scaleToMin = Math.max(
-        minWidth / targetWidth,
-        minHeight / targetHeight,
-      )
-      targetWidth *= scaleToMin
-      targetHeight *= scaleToMin
-    }
-
-    // 纹理尺寸永远不应该超过原图尺寸
-    targetWidth = Math.min(targetWidth, this.originalImage.width)
-    targetHeight = Math.min(targetHeight, this.originalImage.height)
-
-    // 应用 WebGL 最大纹理尺寸限制
-    targetWidth = Math.min(targetWidth, effectiveMaxTextureSize)
-    targetHeight = Math.min(targetHeight, effectiveMaxTextureSize)
-
-    // 将尺寸调整为2的幂次方，这对WebGL性能更好
-    // 但要保持宽高比，所以基于较大的维度来计算
-    const maxDimension = Math.max(targetWidth, targetHeight)
-    const powerOfTwo = Math.pow(2, Math.ceil(Math.log2(maxDimension)))
-
-    // 确保 2 的幂次方尺寸不超过有效最大纹理尺寸
-    const safePowerOfTwo = Math.min(powerOfTwo, effectiveMaxTextureSize)
-
-    // 根据原图宽高比计算最终的纹理尺寸
-    let finalWidth, finalHeight
-    if (aspectRatio >= 1) {
-      // 宽图或正方形，以宽度为基准
-      finalWidth = Math.min(safePowerOfTwo, this.originalImage.width)
-      finalHeight = Math.min(
-        finalWidth / aspectRatio,
-        this.originalImage.height,
-      )
-    } else {
-      // 高图，以高度为基准
-      finalHeight = Math.min(safePowerOfTwo, this.originalImage.height)
-      finalWidth = Math.min(finalHeight * aspectRatio, this.originalImage.width)
-    }
-
-    // 确保最终尺寸不小于最小要求，但不超过有效最大纹理尺寸
-    finalWidth = Math.max(
-      minWidth,
-      Math.min(finalWidth, effectiveMaxTextureSize),
-    )
-    finalHeight = Math.max(
-      minHeight,
-      Math.min(finalHeight, effectiveMaxTextureSize),
-    )
-
-    return { width: Math.round(finalWidth), height: Math.round(finalHeight) }
+    // 如果超出所有级别，返回最高级别
+    return this.LOD_LEVELS.length - 1
   }
 
-  private updateTextureFiltering() {
-    if (!this.texture || !this.originalImage) return
+  private updateLOD() {
+    const optimalLOD = this.selectOptimalLOD()
 
-    const { gl } = this
-    const isSmallImageForFilter =
-      this.originalImage.width < 512 || this.originalImage.height < 512
-    const currentRelativeScale = this.scale / this.getFitToScreenScale()
+    if (optimalLOD === this.currentLOD) {
+      return // 无需更新
+    }
 
-    gl.bindTexture(gl.TEXTURE_2D, this.texture)
+    // 检查目标 LOD 纹理是否已存在
+    let targetTexture = this.lodTextures.get(optimalLOD)
 
-    if (isSmallImageForFilter && currentRelativeScale > 1) {
-      // 对于放大的小图片，使用最近邻插值保持锐利
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
-    } else {
-      // 其他情况使用线性插值获得平滑效果
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    if (!targetTexture) {
+      // 创建新的 LOD 纹理
+      const newTexture = this.createLODTexture(optimalLOD)
+      if (newTexture) {
+        targetTexture = newTexture
+      }
+    }
+
+    if (targetTexture) {
+      this.currentLOD = optimalLOD
+      this.texture = targetTexture
+      console.info(`Switched to LOD ${optimalLOD}`)
     }
   }
 
-  private debouncedTextureUpdate() {
-    // 检查是否需要更新纹理
-    const scaleChange =
-      Math.abs(this.scale - this.currentTextureScale) /
-      Math.max(this.currentTextureScale, 0.1)
-
-    // 降低更新阈值，使纹理更及时地响应缩放变化
-    if (scaleChange < 0.3) {
-      // 即使不需要重新创建纹理，也要更新过滤方式
-      this.updateTextureFiltering()
-      return
-    }
-
+  private debouncedLODUpdate() {
     // 清除之前的防抖调用
-    if (this.textureDebounceId !== null) {
-      clearTimeout(this.textureDebounceId)
+    if (this.lodUpdateDebounceId !== null) {
+      clearTimeout(this.lodUpdateDebounceId)
     }
-
-    // 缩短防抖延迟，使纹理更新更及时
-    const debounceDelay = this.textureDebounceDelay * 0.5
 
     // 设置新的防抖调用
-    this.textureDebounceId = setTimeout(() => {
-      this.textureDebounceId = null
-      this.createOptimizedTexture()
+    this.lodUpdateDebounceId = setTimeout(() => {
+      this.lodUpdateDebounceId = null
+      this.updateLOD()
       this.render()
-    }, debounceDelay)
+    }, this.lodUpdateDelay)
   }
+
   private fitImageToScreen() {
     const scaleX = this.canvasWidth / this.imageWidth
     const scaleY = this.canvasHeight / this.imageHeight
@@ -937,8 +676,8 @@ class WebGLImageViewerEngine {
       this.translateY = this.targetTranslateY
       this.render()
       this.notifyZoomChange()
-      // 动画完成后触发纹理更新
-      this.debouncedTextureUpdate()
+      // 动画完成后触发LOD更新
+      this.debouncedLODUpdate()
     }
   }
 
@@ -1084,12 +823,12 @@ class WebGLImageViewerEngine {
       relativeScale,
       translateX: this.translateX,
       translateY: this.translateY,
-      textureSize: this.lastOptimalTextureSize,
+      currentLOD: this.currentLOD,
+      lodLevels: this.LOD_LEVELS.length,
       canvasSize: { width: this.canvasWidth, height: this.canvasHeight },
       imageSize: { width: this.imageWidth, height: this.imageHeight },
       fitToScreenScale,
       renderCount: performance.now(),
-      textureUpdateCount: this.currentTextureScale,
       maxTextureSize: this.maxTextureSize,
     })
   }
@@ -1389,8 +1128,7 @@ class WebGLImageViewerEngine {
       this.constrainImagePosition()
       this.render()
       this.notifyZoomChange()
-
-      this.debouncedTextureUpdate()
+      this.debouncedLODUpdate()
     }
   }
 
@@ -1454,10 +1192,10 @@ class WebGLImageViewerEngine {
       this.renderThrottleId = null
     }
 
-    // 清理纹理防抖相关的资源
-    if (this.textureDebounceId !== null) {
-      clearTimeout(this.textureDebounceId)
-      this.textureDebounceId = null
+    // 清理LOD更新防抖相关的资源
+    if (this.lodUpdateDebounceId !== null) {
+      clearTimeout(this.lodUpdateDebounceId)
+      this.lodUpdateDebounceId = null
     }
 
     // 清理触摸双击相关的资源
@@ -1467,10 +1205,7 @@ class WebGLImageViewerEngine {
     }
 
     // 清理 WebGL 资源
-    if (this.texture && this.gl) {
-      this.gl.deleteTexture(this.texture)
-      this.texture = null
-    }
+    this.cleanupLODTextures()
   }
 }
 
@@ -1537,12 +1272,12 @@ export const WebGLImageViewer = ({
     relativeScale: 1,
     translateX: 0,
     translateY: 0,
-    textureSize: { width: 0, height: 0 },
+    currentLOD: 0,
+    lodLevels: 0,
     canvasSize: { width: 0, height: 0 },
     imageSize: { width: 0, height: 0 },
     fitToScreenScale: 1,
     renderCount: 0,
-    textureUpdateCount: 0,
     maxTextureSize: 0,
   })
 
@@ -1681,8 +1416,7 @@ export const WebGLImageViewer = ({
             Image: {debugInfo.imageSize.width}×{debugInfo.imageSize.height}
           </div>
           <div>
-            Texture: {debugInfo.textureSize.width}×
-            {debugInfo.textureSize.height}
+            Current LOD: {debugInfo.currentLOD} / {debugInfo.lodLevels - 1}
           </div>
           <div>Max Texture Size: {debugInfo.maxTextureSize}</div>
           <div>Fit Scale: {debugInfo.fitToScreenScale.toFixed(3)}</div>
